@@ -1,0 +1,7 @@
+[global]
+fsid = {{ fsid }}
+mon_initial_members = {{ mon_initial_hosts | join(',') }}
+mon_host = {{ groups['mons'] | map('extract', hostvars, 'ansible_host') | join(',') }}
+
+public network = {{ public_network }}
+cluster network = {{ cluster_network }}

@@ -1,0 +1,7 @@
+---
+- hosts: mgrs
+  become: true
+  vars:
+    ceph_conf_path: /etc/ceph/ceph.conf
+    public_network: "192.168.0.0/16"
+    cluster_network: "192.168.0.0/16"

@@ -1,0 +1,198 @@
+---
+- hosts: mons
+  become: true
+  vars:
+    ceph_conf_path: /etc/ceph/ceph.conf
+    public_network: "192.168.0.0/16"
+    cluster_network: "192.168.0.0/16"
+    mon_initial_hosts: [node1, node2, node3]  # List of initial monitor hosts
+    new_mons: [node4, node5]  # Add new monitors here
+    combined_mons: "{{ mon_initial_hosts + new_mons }}"
+    quorum_check_retries: 10
+    quorum_check_delay: 10
+
+  pre_tasks:
+    - name: Fail if an even total number of monitors is specified
+      fail:
+        msg: "You must specify an odd number of total monitors (initial + new)."
+      when: (combined_mons | length) % 2 == 0
+
+  tasks:
+    - name: Check if ceph.conf exists
+      stat:
+        path: "{{ ceph_conf_path }}"
+      register: ceph_conf_check
+      when: inventory_hostname == mon_initial_hosts[0]
+
+    - name: Extract FSID from ceph.conf if it exists
+      command: grep -Po '(?<=^fsid = )[a-f0-9-]+' /etc/ceph/ceph.conf
+      register: extracted_fsid
+      when: inventory_hostname == mon_initial_hosts[0] and ceph_conf_check.stat.exists
+
+    - name: Generate a new fsid if ceph.conf does not exist
+      command: "uuidgen"
+      register: generated_fsid
+      when: inventory_hostname == mon_initial_hosts[0] and not ceph_conf_check.stat.exists
+
+    - name: Set FSID fact from generated or existing ceph.conf
+      set_fact:
+        fsid: "{{ generated_fsid.stdout if not ceph_conf_check.stat.exists else extracted_fsid.stdout }}"
+      when: inventory_hostname == mon_initial_hosts[0]
+
+    - name: Print the value of a variable
+      debug:
+        msg: "The value of the variable is: {{ fsid }}"
+      when: inventory_hostname == mon_initial_hosts[0]
+
+    - name: Update System
+      dnf:
+        name: '*'
+        state: latest
+
+    - name: Check if ceph-stable.repo exists
+      stat:
+        path: /etc/yum.repos.d/ceph-stable.repo
+      register: ceph_stable_check
+
+    - name: Add Ceph Quincy repository (x86_64 for Rocky Linux)
+      copy:
+        content: |
+          [Ceph-Stable]
+          name=Ceph Quincy packages for
+          baseurl=https://download.ceph.com/rpm-quincy/el8/x86_64/
+          enabled=1
+          gpgcheck=1
+          type=rpm-md
+          gpgkey=https://download.ceph.com/keys/release.asc
+        dest: /etc/yum.repos.d/ceph-stable.repo
+      when: not ceph_stable_check.stat.exists
+
+    - name: Update System
+      dnf:
+        name: '*'
+        state: latest
+
+    - name: Install EPEL packages
+      package:
+        name:
+          - epel-release
+        state: present
+
+    - name: Install Ceph packages
+      package:
+        name:
+          - ceph-mon
+        state: present
+
+    - name: Allow Ceph service
+      firewalld:
+        service: ceph
+        permanent: yes
+        state: enabled
+        zone: public  # Adjust the zone as needed
+
+    - name: Allow Ceph Monitor service
+      firewalld:
+        service: ceph-mon
+        permanent: yes
+        state: enabled
+        zone: public  
+
+    - name: Create Ceph configuration file (only if it doesn't exist)
+      template:
+        src: ceph.conf.j2
+        dest: "{{ ceph_conf_path }}"
+      when: inventory_hostname == mon_initial_hosts[0] and not ceph_conf_check.stat.exists
+
+    - name: Check if keyring exists
+      stat:
+        path: "/etc/ceph/keyring"
+      register: keyring_check
+
+    - name: Generate keyring (only for the first monitor if keyring does not exist)
+      shell: |
+        ceph-authtool --create-keyring /etc/ceph/keyring --gen-key -n mon.
+      when: inventory_hostname == mon_initial_hosts[0] and not keyring_check.stat.exists
+
+    - name: Create the client.admin key for the keyring.
+      shell: |
+        ceph-authtool /etc/ceph/keyring --gen-key -n client.admin --cap mon 'allow *' --cap osd 'allow *' --cap mds 'allow'
+      when: inventory_hostname == mon_initial_hosts[0] and not keyring_check.stat.exists
+
+    - name: Check if mon already exists on the first node
+      stat:
+        path: "/var/lib/ceph/mon/ceph-{{ mon_initial_hosts[0] }}"
+      register: first_mon_check
+      when: inventory_hostname == mon_initial_hosts[0]
+
+    - name: bootstrap the first mon in the cluster
+      shell: |
+        ceph-mon --mkfs -i {{ mon_initial_hosts[0] }} --fsid {{ fsid }} --keyring /etc/ceph/keyring
+      when: inventory_hostname == mon_initial_hosts[0] and not first_mon_check.stat.exists
+
+    - name: Ensure ceph user owns all files in /etc/ceph after creating files
+      file:
+        path: /etc/ceph
+        owner: ceph
+        group: ceph
+        recurse: yes
+      when: inventory_hostname == combined_mons[0] and not keyring_check.stat.exists
+
+    - name: Distribute Ceph keyring and configuration to other monitors
+      synchronize:
+        src: "{{ item }}"
+        dest: "/etc/ceph/"
+        mode: push
+      with_items:
+        - "/etc/ceph/keyring"
+        - "{{ ceph_conf_path }}"
+      delegate_to: "{{ mon_initial_hosts[0] }}"
+      when: inventory_hostname != combined_mons[0] and not keyring_check.stat.exists
+
+    - name: Ensure ceph user owns all files in /etc/ceph after transferring files
+      file:
+        path: /etc/ceph
+        owner: ceph
+        group: ceph
+        recurse: yes
+      when: inventory_hostname != combined_mons[0] and not keyring_check.stat.exists
+
+    - name: Ensure FSID is consistent across all nodes
+      set_fact:
+        fsid: "{{ hostvars[mon_initial_hosts[0]].fsid }}"
+      when: inventory_hostname != mon_initial_hosts[0]
+
+    - name: Bootstrap other ceph monitors that haven't been bootstrapped before.
+      shell: |
+        ceph-mon --mkfs -i {{ inventory_hostname }} --fsid {{ fsid }} --keyring /etc/ceph/keyring
+      when: inventory_hostname != combined_mons[0] and not keyring_check.stat.exists
+
+    - name: Start ceph-mon.target systemd service
+      systemd:
+        name: ceph-mon.target
+        state: started
+        enabled: yes
+      when: not keyring_check.stat.exists
+
+    - name: Ensure ceph user owns all files in /var/lib/ceph after bootstrapping
+      file:
+        path: /var/lib/ceph
+        owner: ceph
+        group: ceph
+        recurse: yes
+      when: not keyring_check.stat.exists
+
+    - name: Add new monitors to the cluster
+      shell: |
+        ceph mon add {{ inventory_hostname }} {{ ansible_host }}
+      when: inventory_hostname in new_mons and not keyring_check.stat.exists
+      delegate_to: "{{ mon_initial_hosts[0] }}"
+
+
+
+    - name: Start ceph-mon systemd services for all hosts
+      systemd:
+        name: ceph-mon@{{ inventory_hostname }}
+        state: started
+        enabled: yes
+      when: not keyring_check.stat.exists
