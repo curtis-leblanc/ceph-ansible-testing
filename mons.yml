@@ -98,6 +98,9 @@
         state: enabled
         zone: public  
 
+    - name: reload firewall
+      command: firewall-cmd --reload 
+
     - name: Create Ceph configuration file (only if it doesn't exist)
       template:
         src: ceph.conf.j2
